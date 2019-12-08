@@ -4,6 +4,7 @@ import org.apache.spark.storage.StorageLevel
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.{functions => F, types => T}
 import org.apache.spark.sql.{DataFrame}
+import org.apache.spark.ml.feature.{OneHotEncoderEstimator, StringIndexer, Imputer}
 
 object fraud extends App {
 
@@ -54,7 +55,7 @@ object fraud extends App {
       return _tmp.select(_tmp.columns.map(c => (F.col(c)/nRows).alias(c)):_*)
     }
 
-    def removeNullRows(): Unit = {
+    def removeNullRows(): DataFrame = {
 
       val isNull = df.select(df.columns.map(c => (F.when(F.col(c).isNull,  value = 1).otherwise( value = 0)).alias(c)):_*)
       isNull.show
@@ -63,20 +64,22 @@ object fraud extends App {
                     .dropWhile(x => x != "TransactionID")
                     .map(x => F.col(x))
 
-      //isNull
-      //  .withColumn("noNulls",toAdd.reduce(_ + _))
-      //  .where(F.col("noNulls") == 0 )
+      return isNull
+                .withColumn("noNulls", toAdd.reduce(_ + _))
+                .where(F.col("noNulls") === 0)
+                .drop("noNulls")
+
 
     }
 
   }
 
 
-    val spark = SparkSession
-      .builder()
-      .master(master = "local[6]")
-      .appName(name = "IEE_CIS_Fraud")
-      .getOrCreate()
+    val spark = SparkSession.
+      builder().
+      master(master = "local[10]").
+      appName(name = "IEE_CIS_Fraud").
+      getOrCreate()
 
     import spark.implicits._
 
@@ -87,14 +90,14 @@ object fraud extends App {
       T.StructField("TransactionDT", T.IntegerType, true),
       T.StructField("TransactionAmt", T.DoubleType, true),
       T.StructField("ProductCD", T.StringType, true),
-      T.StructField("card1", T.IntegerType, true),
-      T.StructField("card2", T.DoubleType, true),
-      T.StructField("card3", T.DoubleType, true),
+      T.StructField("card1", T.StringType, true),
+      T.StructField("card2", T.StringType, true),
+      T.StructField("card3", T.StringType, true),
       T.StructField("card4", T.StringType, true),
-      T.StructField("card5", T.DoubleType, true),
+      T.StructField("card5", T.StringType, true),
       T.StructField("card6", T.StringType, true),
-      T.StructField("addr1", T.DoubleType, true),
-      T.StructField("addr2", T.DoubleType, true),
+      T.StructField("addr1", T.StringType, true),
+      T.StructField("addr2", T.StringType, true),
       T.StructField("dist1", T.DoubleType, true),
       T.StructField("dist2", T.DoubleType, true),
       T.StructField("P_emaildomain", T.StringType, true),
@@ -478,12 +481,12 @@ object fraud extends App {
       T.StructField("V339", T.DoubleType, true)
     ))
 
-    val trans = spark.read.format(source = "csv")
-      .schema(transactionSchema)
-      .option("sep", ",")
-      .option("header", "true")
-      .load(path = "data/train_transaction.csv")
-      .coalesce(numPartitions = 6)
+    val trans = spark.read.format(source = "csv").
+      schema(transactionSchema).
+      option("sep", ",").
+      option("header", "true").
+      load(path = "data/train_transaction.csv").
+      repartition(numPartitions = 10)
 
     trans.persist(StorageLevel.MEMORY_ONLY)
 
@@ -495,15 +498,87 @@ object fraud extends App {
 
 
     // How Many Nulls
-    trans.percentNulls()
-      .withColumn("id", F.lit(1))
-      .melt(id_vars = Seq("id"),
-            value_vars = trans.columns)
-      .drop("id")
-      .orderBy(sortExprs = F.col("value").desc)
-      .show(1000)
+    trans.percentNulls().
+      withColumn("id", F.lit(1)).
+      melt(id_vars = Seq("id"),
+            value_vars = trans.columns).
+      drop("id").
+      orderBy(sortExprs = F.col("value").desc).
+      show(1000)
+
+    // Remove all Nulls --> there aren't any rows left!!
+  trans.removeNullRows.show
 
 
-    trans.removeNullRows
+  ///// finding categorical columns
+  val identity_catCols = (Vector("DeviceType", "DeviceInfo") ++ (12 to 38).map(x => "id_" ++ x.toString())).toArray
+  val trans_catCols = (Vector("ProductCD", "P_emaildomain", "R_emaildomain", "addr1", "addr2") ++
+                             (1 to 6).map(x => "card" ++ x.toString())++
+                             (1 to 9).map(x => "M" ++ x.toString())).toArray
+
+  val trans_catCols_index = trans_catCols.map(x => x ++ "_index")
+
+  var categoricalsVars = trans
+
+  for ((col, index_col) <- trans_catCols.zip(trans_catCols_index)){
+
+    val indexer = new StringIndexer().
+        setInputCol(col).
+        setOutputCol(index_col).
+        setHandleInvalid("keep").
+        fit(categoricalsVars)
+
+    categoricalsVars = indexer.transform(categoricalsVars)
+
+  }
+
+  var s_cols  = Array(F.col("TransactionID")) ++ trans_catCols_index.map(x => F.col(x))
+
+  categoricalsVars = categoricalsVars.select(s_cols:_*).withColumnRenamed("TransactionID", "TransactionID_r")
+
+  // Try without to begin with, random forest not best with oneHot
+  //val encoder = new OneHotEncoderEstimator()
+  //  .setInputCols(catCols)
+  //  .setOutputCols(catCols)
+
+
+
+  ///// Have to try a different strategy, try replacing values
+
+  val continuousCols = (trans.columns.toSet -- (trans_catCols.toSet ++ Set("TransactionID", "TransactionDT","isFraud"))).toArray.map(x => x.toString)
+  val continuousCols_index = continuousCols.map(x => x + "_index")
+
+
+  val imputer = new Imputer()
+                       .setInputCols(continuousCols)
+                       .setOutputCols(continuousCols_index)
+                       .setStrategy("mean")
+                       .fit(trans)
+
+  s_cols  = Array(F.col("TransactionID")) ++ continuousCols.map(x => F.col(x))
+
+  var continuousVars = imputer.transform(trans.select(s_cols:_*))
+
+  s_cols  = Array(F.col("TransactionID")) ++ continuousCols_index.map(x => F.col(x))
+
+
+  continuousVars = continuousVars.select(s_cols:_*).withColumnRenamed("TransactionID", "TransactionID_r")
+
+
+  /// Scaling?
+
+  s_cols = Array("TransactionID", "TransactionDT","isFraud").map(x => F.col(x))
+
+  val cleaned = trans
+                    .select(s_cols:_*)
+                    .join(continuousVars, F.col("TransactionID") === F.col("TransactionID_r") )
+                    .drop("TransactionID_r")
+                    .join(categoricalsVars, F.col("TransactionID") === F.col("TransactionID_r"))
+                    .drop("TransactionID_r")
+  cleaned.show
+
+  //categoricalsVars = categoricalsVars.select(s_cols:_*)
+  //continuousVars.show(200)
+
 
 }
